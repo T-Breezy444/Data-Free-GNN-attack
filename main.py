@@ -4,11 +4,13 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch_geometric.datasets import Planetoid
 from torch_geometric.transforms import NormalizeFeatures
-from torch_geometric.nn import GCNConv
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 from tqdm import tqdm
+
+# Import the victim model
+from victim import create_victim_model_cora
 
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -17,20 +19,8 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 dataset = Planetoid(root='/tmp/Cora', name='Cora', transform=NormalizeFeatures())
 data = dataset[0].to(device)
 
-# Define a smaller GNN model
-class SimpleGNN(torch.nn.Module):
-    def __init__(self, num_features, hidden_channels, num_classes):
-        super(SimpleGNN, self).__init__()
-        self.conv1 = GCNConv(num_features, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, num_classes)
-
-    def forward(self, x, edge_index):
-        x = F.relu(self.conv1(x, edge_index))
-        x = self.conv2(x, edge_index)
-        return x
-
 # Initialize victim model
-victim_model = SimpleGNN(dataset.num_features, 32, dataset.num_classes).to(device)
+victim_model = create_victim_model_cora().to(device)
 
 # Train victim model
 def train_victim_model(model, data, epochs=200):
@@ -39,7 +29,7 @@ def train_victim_model(model, data, epochs=200):
     for epoch in range(epochs):
         optimizer.zero_grad()
         out = model(data.x, data.edge_index)
-        loss = F.nll_loss(F.log_softmax(out[data.train_mask], dim=1), data.y[data.train_mask])
+        loss = F.nll_loss(out[data.train_mask], data.y[data.train_mask])
         loss.backward()
         optimizer.step()
         if (epoch + 1) % 10 == 0:
@@ -75,7 +65,7 @@ noise_dim = 32
 num_nodes = 500  # Reduce number of nodes
 feature_dim = dataset.num_features
 generator = GraphGenerator(noise_dim, num_nodes, feature_dim).to(device)
-surrogate_model = SimpleGNN(dataset.num_features, 32, dataset.num_classes).to(device)
+surrogate_model = create_victim_model_cora().to(device)
 
 # Define attack function (Type I attack as per the paper)
 def type_i_attack(generator, surrogate_model, victim_model, num_queries, device):
