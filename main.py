@@ -1,3 +1,7 @@
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,21 +12,23 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 from tqdm import tqdm
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
 
-# Import the victim model
-from victim import create_victim_model_cora
+from models.victim import create_victim_model_cora
+from models.generator import GraphGenerator
 
-# Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Load Cora dataset
 dataset = Planetoid(root='/tmp/Cora', name='Cora', transform=NormalizeFeatures())
 data = dataset[0].to(device)
 
-# Initialize victim model
+# Initialize and train victim model
 victim_model = create_victim_model_cora().to(device)
 
-# Train victim model
 def train_victim_model(model, data, epochs=200):
     optimizer = optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
     model.train()
@@ -38,36 +44,14 @@ def train_victim_model(model, data, epochs=200):
 print("Training victim model...")
 train_victim_model(victim_model, data)
 
-# Define smaller generator model
-class GraphGenerator(nn.Module):
-    def __init__(self, noise_dim, num_nodes, feature_dim):
-        super(GraphGenerator, self).__init__()
-        self.noise_dim = noise_dim
-        self.num_nodes = num_nodes
-        self.feature_dim = feature_dim
-
-        self.fc1 = nn.Linear(noise_dim, 64)
-        self.fc2 = nn.Linear(64, 128)
-        self.fc3 = nn.Linear(128, num_nodes * feature_dim)
-        self.fc4 = nn.Linear(128, num_nodes * num_nodes)
-
-    def forward(self, z):
-        h = F.relu(self.fc1(z))
-        h = F.relu(self.fc2(h))
-        features = torch.tanh(self.fc3(h)).view(self.num_nodes, self.feature_dim)
-        adj = torch.sigmoid(self.fc4(h)).view(self.num_nodes, self.num_nodes)
-        adj = (adj + adj.t()) / 2
-        adj = adj * (1 - torch.eye(self.num_nodes, device=adj.device))
-        return features, adj
-
 # Initialize generator and surrogate model
 noise_dim = 32
-num_nodes = 500  # Reduce number of nodes
+num_nodes = 500
 feature_dim = dataset.num_features
-generator = GraphGenerator(noise_dim, num_nodes, feature_dim).to(device)
+generator = GraphGenerator(noise_dim, num_nodes, feature_dim, generator_type='cosine').to(device)
 surrogate_model = create_victim_model_cora().to(device)
 
-# Define attack function (Type I attack as per the paper)
+# Define attack function (Type I attack)
 def type_i_attack(generator, surrogate_model, victim_model, num_queries, device):
     generator_optimizer = optim.Adam(generator.parameters(), lr=1e-4)
     surrogate_optimizer = optim.Adam(surrogate_model.parameters(), lr=0.01)
@@ -78,7 +62,7 @@ def type_i_attack(generator, surrogate_model, victim_model, num_queries, device)
 
     for query in tqdm(range(num_queries)):
         # Train generator
-        for _ in range(2):  # n_G = 2 as per the paper
+        for _ in range(2):
             generator_optimizer.zero_grad()
             z = torch.randn(1, noise_dim).to(device)
             features, adj = generator(z)
@@ -111,7 +95,7 @@ def type_i_attack(generator, surrogate_model, victim_model, num_queries, device)
             generator_losses.append(loss.item())
 
         # Train surrogate model
-        for _ in range(5):  # n_S = 5 as per the paper
+        for _ in range(5):
             surrogate_optimizer.zero_grad()
             z = torch.randn(1, noise_dim).to(device)
             features, adj = generator(z)
@@ -130,14 +114,11 @@ def type_i_attack(generator, surrogate_model, victim_model, num_queries, device)
         if query % 10 == 0:
             print(f"Query {query}: Gen Loss = {generator_losses[-1]:.4f}, Surr Loss = {surrogate_losses[-1]:.4f}")
 
-        # Clear cache to free up memory
-        torch.cuda.empty_cache()
-
     return surrogate_model, generator_losses, surrogate_losses
 
 # Run attack
 print("Running attack...")
-num_queries = 400  # Reduced number of queries
+num_queries = 400
 trained_surrogate, generator_losses, surrogate_losses = type_i_attack(generator, surrogate_model, victim_model, num_queries, device)
 
 # Evaluate models
@@ -153,15 +134,80 @@ def evaluate_models(victim_model, surrogate_model, data):
         surrogate_preds = surrogate_out.argmax(dim=1)
 
     accuracy = accuracy_score(victim_preds[data.test_mask].cpu(), surrogate_preds[data.test_mask].cpu())
+    fidelity = accuracy_score(victim_preds.cpu(), surrogate_preds.cpu())
     f1 = f1_score(victim_preds[data.test_mask].cpu(), surrogate_preds[data.test_mask].cpu(), average='weighted')
     conf_matrix = confusion_matrix(victim_preds[data.test_mask].cpu(), surrogate_preds[data.test_mask].cpu(), labels=range(dataset.num_classes))
 
-    return accuracy, f1, conf_matrix
+    return accuracy, fidelity, f1, conf_matrix
 
 print("Evaluating models...")
-accuracy, f1, conf_matrix = evaluate_models(victim_model, trained_surrogate, data)
+accuracy, fidelity, f1, conf_matrix = evaluate_models(victim_model, trained_surrogate, data)
+
+# Generate PDF report
+def generate_pdf_report(accuracy, fidelity, f1, conf_matrix, generator_losses, surrogate_losses):
+    doc = SimpleDocTemplate("attack_report.pdf", pagesize=letter)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    # Title
+    elements.append(Paragraph("STEALGNN Attack Report", styles['Title']))
+
+    # Metrics table
+    data = [
+        ["Metric", "Value"],
+        ["Accuracy", f"{accuracy:.4f}"],
+        ["Fidelity", f"{fidelity:.4f}"],
+        ["F1 Score", f"{f1:.4f}"]
+    ]
+    t = Table(data)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 14),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 1), (-1, -1), 12),
+        ('TOPPADDING', (0, 1), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+    ]))
+    elements.append(t)
+
+    # Confusion Matrix
+    elements.append(Paragraph("Confusion Matrix", styles['Heading2']))
+    conf_data = [[str(x) for x in row] for row in conf_matrix]
+    conf_data.insert(0, [f"Class {i}" for i in range(len(conf_matrix))])
+    t = Table(conf_data)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 1), (-1, -1), 10),
+        ('TOPPADDING', (0, 1), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+    ]))
+    elements.append(t)
+
+    doc.build(elements)
+
+# Generate report
+generate_pdf_report(accuracy, fidelity, f1, conf_matrix, generator_losses, surrogate_losses)
 
 print(f"Accuracy of surrogate model: {accuracy:.4f}")
+print(f"Fidelity of surrogate model: {fidelity:.4f}")
 print(f"F1 Score of surrogate model: {f1:.4f}")
 
 # Plot confusion matrix
@@ -189,7 +235,7 @@ plt.legend()
 plt.savefig('losses_over_time.png')
 plt.close()
 
-print("Attack completed. Results saved in 'confusion_matrix.png' and 'losses_over_time.png'")
+print("Attack completed. Results saved in 'confusion_matrix.png', 'losses_over_time.png', and 'attack_report.pdf'")
 
 # Calculate improvement over random guessing
 random_accuracy = 1 / dataset.num_classes
