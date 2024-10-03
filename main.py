@@ -1,214 +1,311 @@
+import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-from torch_geometric.datasets import Planetoid
+from torch_geometric.datasets import Planetoid, Amazon
+from ogb.nodeproppred import PygNodePropPredDataset
 from torch_geometric.transforms import NormalizeFeatures
-from torch_geometric.nn import GCNConv
-import numpy as np
+from torch_geometric.utils import to_undirected
 import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 from tqdm import tqdm
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
 
-# Set device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# Import our custom modules
+from models.victim import create_victim_model_cora, create_victim_model_computers, create_victim_model_pubmed, create_victim_model_ogb_arxiv
+from models.generator import GraphGenerator
+from attacks.attack1 import TypeIAttack
+from attacks.attack2 import TypeIIAttack
+from attacks.attack3 import TypeIIIAttack
 
-# Load Cora dataset
-dataset = Planetoid(root='/tmp/Cora', name='Cora', transform=NormalizeFeatures())
-data = dataset[0].to(device)
+def create_masks(num_nodes, train_ratio=0.6, val_ratio=0.2):
+    indices = np.random.permutation(num_nodes)
+    train_size = int(num_nodes * train_ratio)
+    val_size = int(num_nodes * val_ratio)
+    
+    train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    
+    train_mask[indices[:train_size]] = True
+    val_mask[indices[train_size:train_size+val_size]] = True
+    test_mask[indices[train_size+val_size:]] = True
+    
+    return train_mask, val_mask, test_mask
 
-# Define a smaller GNN model
-class SimpleGNN(torch.nn.Module):
-    def __init__(self, num_features, hidden_channels, num_classes):
-        super(SimpleGNN, self).__init__()
-        self.conv1 = GCNConv(num_features, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, num_classes)
+def main(attack_type, dataset_name):
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    def forward(self, x, edge_index):
-        x = F.relu(self.conv1(x, edge_index))
-        x = self.conv2(x, edge_index)
-        return x
+    # Load dataset and create victim model
+    if dataset_name == 'cora':
+        dataset = Planetoid(root='/tmp/Cora', name='Cora', transform=NormalizeFeatures())
+        data = dataset[0].to(device)
+        victim_model = create_victim_model_cora().to(device)
+    elif dataset_name == 'computers':
+        dataset = Amazon(root='/tmp/Amazon', name='Computers', transform=NormalizeFeatures())
+        data = dataset[0].to(device)
+        data.edge_index = to_undirected(data.edge_index)
+        train_mask, val_mask, test_mask = create_masks(data.num_nodes)
+        data.train_mask = train_mask.to(device)
+        data.val_mask = val_mask.to(device)
+        data.test_mask = test_mask.to(device)
+        victim_model = create_victim_model_computers().to(device)
+    elif dataset_name == 'pubmed':
+        dataset = Planetoid(root='/tmp/Pubmed', name='Pubmed', transform=NormalizeFeatures())
+        data = dataset[0].to(device)
+        victim_model = create_victim_model_pubmed().to(device)
+    elif dataset_name == 'ogb-arxiv':
+        dataset = PygNodePropPredDataset(name='ogbn-arxiv', transform=NormalizeFeatures())
+        data = dataset[0].to(device)
+        split_idx = dataset.get_idx_split()
+        data.train_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+        data.val_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+        data.test_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+        data.train_mask[split_idx['train']] = True
+        data.val_mask[split_idx['valid']] = True
+        data.test_mask[split_idx['test']] = True
+        data.train_mask = data.train_mask.to(device)
+        data.val_mask = data.val_mask.to(device)
+        data.test_mask = data.test_mask.to(device)
+        victim_model = create_victim_model_ogb_arxiv().to(device)
+    else:
+        raise ValueError("Invalid dataset name. Choose 'cora', 'computers', 'pubmed', or 'ogb-arxiv'.")
 
-# Initialize victim model
-victim_model = SimpleGNN(dataset.num_features, 32, dataset.num_classes).to(device)
+    # Train victim model
+    train_victim_model(victim_model, data, dataset_name)
 
-# Train victim model
-def train_victim_model(model, data, epochs=200):
-    optimizer = optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+    # Initialize generator and surrogate model(s)
+    noise_dim = 32
+    num_nodes = 500
+    feature_dim = dataset.num_features
+    output_dim = dataset.num_classes
+
+    generator = GraphGenerator(noise_dim, num_nodes, feature_dim, generator_type='cosine').to(device)
+    
+    if dataset_name == 'cora':
+        surrogate_model1 = create_victim_model_cora().to(device)
+    elif dataset_name == 'computers':
+        surrogate_model1 = create_victim_model_computers().to(device)
+    elif dataset_name == 'pubmed':
+        surrogate_model1 = create_victim_model_pubmed().to(device)
+    elif dataset_name == 'ogb-arxiv':
+        surrogate_model1 = create_victim_model_ogb_arxiv().to(device)
+
+    # Attack parameters
+    num_queries = 700
+    generator_lr = 1e-6
+    surrogate_lr = 0.001
+    n_generator_steps = 2
+    n_surrogate_steps = 5
+
+    # Run attack based on attack_type
+    print(f"Running attack type {attack_type} on {dataset_name} dataset...")
+
+    if attack_type == 1:
+        attack = TypeIAttack(generator, surrogate_model1, victim_model, device, 
+                             noise_dim, num_nodes, feature_dim, generator_lr, surrogate_lr,
+                             n_generator_steps, n_surrogate_steps)
+    elif attack_type == 2:
+        attack = TypeIIAttack(generator, surrogate_model1, victim_model, device, 
+                              noise_dim, num_nodes, feature_dim, generator_lr, surrogate_lr,
+                              n_generator_steps, n_surrogate_steps)
+    elif attack_type == 3:
+        if dataset_name == 'cora':
+            surrogate_model2 = create_victim_model_cora().to(device)
+        elif dataset_name == 'computers':
+            surrogate_model2 = create_victim_model_computers().to(device)
+        elif dataset_name == 'pubmed':
+            surrogate_model2 = create_victim_model_pubmed().to(device)
+        elif dataset_name == 'ogb-arxiv':
+            surrogate_model2 = create_victim_model_ogb_arxiv().to(device)
+        
+        attack = TypeIIIAttack(generator, surrogate_model1, surrogate_model2, victim_model, device, 
+                            noise_dim, num_nodes, feature_dim, generator_lr, surrogate_lr,
+                            n_generator_steps, n_surrogate_steps)
+    else:
+        raise ValueError("Invalid attack type. Choose 1, 2, or 3.")
+
+    trained_surrogate, generator_losses, surrogate_losses = attack.attack(num_queries)
+
+    # Evaluate models
+    accuracy, fidelity, f1, conf_matrix = evaluate_models(victim_model, trained_surrogate, data)
+
+    # Calculate random baselines
+    random_accuracy, random_f1 = calculate_random_baselines(data)
+
+    # Print and store stats
+    stats = {
+        "Dataset": dataset_name,
+        "Attack Type": attack_type,
+        "Accuracy": accuracy,
+        "Fidelity": fidelity,
+        "F1 Score": f1,
+        "Random Accuracy": random_accuracy,
+        "Random F1": random_f1,
+        "Accuracy Improvement": (accuracy - random_accuracy) / random_accuracy * 100,
+        "F1 Improvement": (f1 - random_f1) / random_f1 * 100
+    }
+
+    print_stats(stats)
+
+    # Plot results
+    plot_confusion_matrix(conf_matrix, output_dim, attack_type, dataset_name)
+    plot_losses(generator_losses, surrogate_losses, attack_type, dataset_name)
+
+    # Generate PDF report
+    generate_pdf_report(stats, conf_matrix, attack_type, dataset_name)
+
+def train_victim_model(model, data, dataset_name, epochs=200, lr=0.01, weight_decay=5e-4):
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     model.train()
     for epoch in range(epochs):
         optimizer.zero_grad()
         out = model(data.x, data.edge_index)
-        loss = F.nll_loss(F.log_softmax(out[data.train_mask], dim=1), data.y[data.train_mask])
+        if dataset_name == 'ogb-arxiv':
+            loss = nn.functional.nll_loss(out[data.train_mask], data.y.squeeze()[data.train_mask])
+        else:
+            loss = nn.functional.nll_loss(out[data.train_mask], data.y[data.train_mask])
         loss.backward()
         optimizer.step()
+        
         if (epoch + 1) % 10 == 0:
-            print(f'Epoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}')
-
-print("Training victim model...")
-train_victim_model(victim_model, data)
-
-# Define smaller generator model
-class GraphGenerator(nn.Module):
-    def __init__(self, noise_dim, num_nodes, feature_dim):
-        super(GraphGenerator, self).__init__()
-        self.noise_dim = noise_dim
-        self.num_nodes = num_nodes
-        self.feature_dim = feature_dim
-
-        self.fc1 = nn.Linear(noise_dim, 64)
-        self.fc2 = nn.Linear(64, 128)
-        self.fc3 = nn.Linear(128, num_nodes * feature_dim)
-        self.fc4 = nn.Linear(128, num_nodes * num_nodes)
-
-    def forward(self, z):
-        h = F.relu(self.fc1(z))
-        h = F.relu(self.fc2(h))
-        features = torch.tanh(self.fc3(h)).view(self.num_nodes, self.feature_dim)
-        adj = torch.sigmoid(self.fc4(h)).view(self.num_nodes, self.num_nodes)
-        adj = (adj + adj.t()) / 2
-        adj = adj * (1 - torch.eye(self.num_nodes, device=adj.device))
-        return features, adj
-
-# Initialize generator and surrogate model
-noise_dim = 32
-num_nodes = 500  # Reduce number of nodes
-feature_dim = dataset.num_features
-generator = GraphGenerator(noise_dim, num_nodes, feature_dim).to(device)
-surrogate_model = SimpleGNN(dataset.num_features, 32, dataset.num_classes).to(device)
-
-# Define attack function (Type I attack as per the paper)
-def type_i_attack(generator, surrogate_model, victim_model, num_queries, device):
-    generator_optimizer = optim.Adam(generator.parameters(), lr=1e-4)
-    surrogate_optimizer = optim.Adam(surrogate_model.parameters(), lr=0.01)
-    criterion = nn.CrossEntropyLoss()
-
-    generator_losses = []
-    surrogate_losses = []
-
-    for query in tqdm(range(num_queries)):
-        # Train generator
-        for _ in range(2):  # n_G = 2 as per the paper
-            generator_optimizer.zero_grad()
-            z = torch.randn(1, noise_dim).to(device)
-            features, adj = generator(z)
-            
-            edge_index = adj.nonzero().t()
-            
+            model.eval()
             with torch.no_grad():
-                victim_output = victim_model(features, edge_index)
-            surrogate_output = surrogate_model(features, edge_index)
+                val_out = model(data.x, data.edge_index)
+                if dataset_name == 'ogb-arxiv':
+                    val_loss = nn.functional.nll_loss(val_out[data.val_mask], data.y.squeeze()[data.val_mask])
+                    val_acc = (val_out[data.val_mask].argmax(dim=1) == data.y.squeeze()[data.val_mask]).float().mean()
+                else:
+                    val_loss = nn.functional.nll_loss(val_out[data.val_mask], data.y[data.val_mask])
+                    val_acc = (val_out[data.val_mask].argmax(dim=1) == data.y[data.val_mask]).float().mean()
+            model.train()
+            print(f'Epoch {epoch+1}/{epochs}, Train Loss: {loss.item():.4f}, Val Loss: {val_loss.item():.4f}, Val Acc: {val_acc.item():.4f}')
 
-            loss = -criterion(surrogate_output, victim_output.argmax(dim=1))
-
-            # Zeroth-order optimization
-            epsilon = 1e-4
-            u = torch.randn_like(z)
-            perturbed_z = z + epsilon * u
-            perturbed_features, perturbed_adj = generator(perturbed_z)
-            
-            perturbed_edge_index = perturbed_adj.nonzero().t()
-            
-            with torch.no_grad():
-                perturbed_victim_output = victim_model(perturbed_features, perturbed_edge_index)
-            perturbed_surrogate_output = surrogate_model(perturbed_features, perturbed_edge_index)
-            perturbed_loss = -criterion(perturbed_surrogate_output, perturbed_victim_output.argmax(dim=1))
-
-            estimated_gradient = (perturbed_loss - loss) / epsilon * u
-            z.grad = estimated_gradient
-
-            generator_optimizer.step()
-            generator_losses.append(loss.item())
-
-        # Train surrogate model
-        for _ in range(5):  # n_S = 5 as per the paper
-            surrogate_optimizer.zero_grad()
-            z = torch.randn(1, noise_dim).to(device)
-            features, adj = generator(z)
-            
-            edge_index = adj.nonzero().t()
-
-            with torch.no_grad():
-                victim_output = victim_model(features, edge_index)
-            surrogate_output = surrogate_model(features, edge_index)
-
-            loss = criterion(surrogate_output, victim_output.argmax(dim=1))
-            loss.backward()
-            surrogate_optimizer.step()
-            surrogate_losses.append(loss.item())
-
-        if query % 10 == 0:
-            print(f"Query {query}: Gen Loss = {generator_losses[-1]:.4f}, Surr Loss = {surrogate_losses[-1]:.4f}")
-
-        # Clear cache to free up memory
-        torch.cuda.empty_cache()
-
-    return surrogate_model, generator_losses, surrogate_losses
-
-# Run attack
-print("Running attack...")
-num_queries = 400  # Reduced number of queries
-trained_surrogate, generator_losses, surrogate_losses = type_i_attack(generator, surrogate_model, victim_model, num_queries, device)
-
-# Evaluate models
-def evaluate_models(victim_model, surrogate_model, data):
+def evaluate_models(victim_model, trained_surrogate, data):
     victim_model.eval()
-    surrogate_model.eval()
+    if isinstance(trained_surrogate, tuple):
+        surrogate_model1, surrogate_model2 = trained_surrogate
+        surrogate_model1.eval()
+        surrogate_model2.eval()
+    else:
+        surrogate_model = trained_surrogate
+        surrogate_model.eval()
     
     with torch.no_grad():
         victim_out = victim_model(data.x, data.edge_index)
-        surrogate_out = surrogate_model(data.x, data.edge_index)
+        if isinstance(trained_surrogate, tuple):
+            surrogate_out1 = surrogate_model1(data.x, data.edge_index)
+            surrogate_out2 = surrogate_model2(data.x, data.edge_index)
+            surrogate_out = (surrogate_out1 + surrogate_out2) / 2  # Simple ensemble
+        else:
+            surrogate_out = surrogate_model(data.x, data.edge_index)
         
         victim_preds = victim_out.argmax(dim=1)
         surrogate_preds = surrogate_out.argmax(dim=1)
 
     accuracy = accuracy_score(victim_preds[data.test_mask].cpu(), surrogate_preds[data.test_mask].cpu())
+    fidelity = accuracy_score(victim_preds[data.test_mask].cpu(), surrogate_preds[data.test_mask].cpu())
     f1 = f1_score(victim_preds[data.test_mask].cpu(), surrogate_preds[data.test_mask].cpu(), average='weighted')
-    conf_matrix = confusion_matrix(victim_preds[data.test_mask].cpu(), surrogate_preds[data.test_mask].cpu(), labels=range(dataset.num_classes))
+    conf_matrix = confusion_matrix(victim_preds[data.test_mask].cpu(), surrogate_preds[data.test_mask].cpu())
 
-    return accuracy, f1, conf_matrix
+    return accuracy, fidelity, f1, conf_matrix
 
-print("Evaluating models...")
-accuracy, f1, conf_matrix = evaluate_models(victim_model, trained_surrogate, data)
+def plot_confusion_matrix(conf_matrix, num_classes, attack_type, dataset_name):
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues')
+    plt.title(f'Confusion Matrix - Type {attack_type} Attack on {dataset_name}')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.savefig(f'confusion_matrix_type{attack_type}_{dataset_name}.png')
+    plt.close()
 
-print(f"Accuracy of surrogate model: {accuracy:.4f}")
-print(f"F1 Score of surrogate model: {f1:.4f}")
+def plot_losses(generator_losses, surrogate_losses, attack_type, dataset_name):
+    plt.figure(figsize=(10, 5))
+    plt.plot(generator_losses, label='Generator Loss')
+    plt.plot(surrogate_losses, label='Surrogate Loss')
+    plt.title(f'Losses over time - Type {attack_type} Attack on {dataset_name}')
+    plt.xlabel('Query')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.savefig(f'losses_over_time_type{attack_type}_{dataset_name}.png')
+    plt.close()
 
-# Plot confusion matrix
-plt.figure(figsize=(10, 8))
-plt.imshow(conf_matrix, interpolation='nearest', cmap=plt.cm.Blues)
-plt.title('Confusion Matrix')
-plt.colorbar()
-tick_marks = np.arange(dataset.num_classes)
-plt.xticks(tick_marks, range(dataset.num_classes), rotation=45)
-plt.yticks(tick_marks, range(dataset.num_classes))
-plt.xlabel('Predicted')
-plt.ylabel('True')
-plt.tight_layout()
-plt.savefig('confusion_matrix.png')
-plt.close()
+def calculate_random_baselines(data):
+    num_classes = data.y.max().item() + 1
+    random_preds = torch.randint(0, num_classes, data.y.shape).to(data.y.device)
+    random_accuracy = accuracy_score(data.y[data.test_mask].cpu(), random_preds[data.test_mask].cpu())
+    random_f1 = f1_score(data.y[data.test_mask].cpu(), random_preds[data.test_mask].cpu(), average='weighted')
+    return random_accuracy, random_f1
 
-# Plot losses
-plt.figure(figsize=(10, 5))
-plt.plot(generator_losses, label='Generator Loss')
-plt.plot(surrogate_losses, label='Surrogate Loss')
-plt.title('Losses over time')
-plt.xlabel('Query')
-plt.ylabel('Loss')
-plt.legend()
-plt.savefig('losses_over_time.png')
-plt.close()
+def print_stats(stats):
+    for key, value in stats.items():
+        if isinstance(value, float):
+            print(f"{key}: {value:.4f}")
+        else:
+            print(f"{key}: {value}")
 
-print("Attack completed. Results saved in 'confusion_matrix.png' and 'losses_over_time.png'")
+def generate_pdf_report(stats, conf_matrix, attack_type, dataset_name):
+    pdf_filename = f"type{attack_type}_attack_{dataset_name}_report.pdf"
+    c = canvas.Canvas(pdf_filename, pagesize=letter)
+    width, height = letter
 
-# Calculate improvement over random guessing
-random_accuracy = 1 / dataset.num_classes
-random_f1 = f1_score([0] * len(data.y[data.test_mask]), data.y[data.test_mask].cpu(), average='weighted')
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, height - 50, f"Type {attack_type} Attack on {dataset_name} Report")
 
-accuracy_improvement = (accuracy - random_accuracy) / random_accuracy * 100
-f1_improvement = (f1 - random_f1) / random_f1 * 100
+    c.setFont("Helvetica", 12)
+    y = height - 100
+    for key, value in stats.items():
+        if isinstance(value, float):
+            c.drawString(50, y, f"{key}: {value:.4f}")
+        else:
+            c.drawString(50, y, f"{key}: {value}")
+        y -= 20
 
-print(f"Random guessing accuracy: {random_accuracy:.4f}")
-print(f"Random guessing F1 Score: {random_f1:.4f}")
-print(f"Accuracy improvement over random guessing: {accuracy_improvement:.2f}%")
-print(f"F1 Score improvement over random guessing: {f1_improvement:.2f}%")
+    # Add confusion matrix to the report
+    c.showPage()
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(50, height - 50, "Confusion Matrix")
+    
+    table_width = 400
+    table_height = 300
+    x_start = (width - table_width) / 2
+    y_start = height - 100 - table_height
+    
+    cell_width = table_width / conf_matrix.shape[1]
+    cell_height = table_height / conf_matrix.shape[0]
+    
+    for i in range(conf_matrix.shape[0]):
+        for j in range(conf_matrix.shape[1]):
+            x = x_start + j * cell_width
+            y = y_start + (conf_matrix.shape[0] - 1 - i) * cell_height
+            c.rect(x, y, cell_width, cell_height)
+            c.setFont("Helvetica", 10)
+            c.drawString(x + 2, y + 2, str(conf_matrix[i, j]))
+
+    c.save()
+    print(f"PDF report saved as {pdf_filename}")
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: python main.py <attack_type> <dataset_name>")
+        print("attack_type: 1, 2, or 3")
+        print("dataset_name: cora, computers, pubmed, or ogb-arxiv")
+        sys.exit(1)
+    
+    try:
+        attack_type = int(sys.argv[1])
+        if attack_type not in [1, 2, 3]:
+            raise ValueError
+        dataset_name = sys.argv[2]
+        if dataset_name not in ['cora', 'computers', 'pubmed', 'ogb-arxiv']:
+            raise ValueError
+    except ValueError:
+        print("Invalid input. Please choose attack type 1, 2, or 3 and dataset name 'cora', 'computers', 'pubmed', or 'ogb-arxiv'.")
+        sys.exit(1)
+
+    main(attack_type, dataset_name)
