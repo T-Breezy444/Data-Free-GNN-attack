@@ -18,15 +18,32 @@ class VictimModel(nn.Module):
         for i, conv in enumerate(self.convs[:-1]):
             x = conv(x, edge_index)
             x = F.relu(x)
-            x = F.dropout(x, p=0.5, training=self.training)
+            x = F.dropout(x, p=0.25, training=self.training)  # Paper: p=0.5
         
         x = self.convs[-1](x, edge_index)
         return F.log_softmax(x, dim=1)
 
 def create_victim_model_cora():
-    input_dim = 1433  # Cora dataset feature dimension
-    hidden_dim = 64   # Half of the paper's hidden dimension (128)
-    output_dim = 7    # Cora dataset has 7 classes
-    num_layers = 2    # Number of GCN layers (same as paper)
+    input_dim = 1433
+    hidden_dim = 64  # Paper: 128
+    output_dim = 7
+    return VictimModel(input_dim, hidden_dim, output_dim)
 
+def create_victim_model_computers():
+    input_dim = 767
+    hidden_dim = 64  # Paper: 128
+    output_dim = 10
+    return VictimModel(input_dim, hidden_dim, output_dim)
+
+def create_victim_model_pubmed():
+    input_dim = 500
+    hidden_dim = 64  # Paper: 128
+    output_dim = 3
+    return VictimModel(input_dim, hidden_dim, output_dim)
+
+def create_victim_model_ogb_arxiv():
+    input_dim = 128
+    hidden_dim = 128  # Paper: 256
+    output_dim = 40
+    num_layers = 2  # Paper: 3
     return VictimModel(input_dim, hidden_dim, output_dim, num_layers)
